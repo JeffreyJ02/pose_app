@@ -1,7 +1,15 @@
-export default function Home() {
+"use client";
+import { useRouter } from "next/navigation";
+
+export default function LandingPage() {
+  const router = useRouter();
+
   return (
-    <main>
-      <h1>Home</h1>
-    </main>
+    <div>
+      <h1>Landing Page</h1>
+      <button onClick={() => router.push("/workout")}>
+        Click me to continue to webcam ui
+      </button>
+    </div>
   );
 }
