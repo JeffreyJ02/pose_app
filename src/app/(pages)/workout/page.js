@@ -12,7 +12,11 @@ import * as poseDetection from "@tensorflow-models/pose-detection";
 import * as tf from "@tensorflow/tfjs-core";
 // Register one of the TF.js backends.
 import "@tensorflow/tfjs-backend-webgl";
-import { drawKeypoints } from "../../../utils/util.js";
+import {
+  drawKeypointsAndSkeleton,
+  createKeypointMap,
+  calculateAngle,
+} from "../../../utils/util.js";
 import Sidebar, { SidebarItem } from "./Sidebar.js";
 
 // UI dependencies
@@ -34,20 +38,39 @@ import {
 } from "@mui/icons-material";
 import { ReactComponent as DumbbellIcon } from "./dumbbell.svg";
 
+const exerciseCalculations = {
+  bicepsCurl: {
+    angles: [
+      ["left_shoulder", "left_elbow", "left_wrist"],
+      ["right_shoulder", "right_elbow", "right_wrist"],
+    ],
+    displayAngle: true,
+    thresholds: {
+      start: 150,
+      end: 30,
+    },
+  },
+};
+
 export default function Workout() {
   // Set up references
   const webcamRef = useRef(null);
   const canvasRef = useRef(null);
   const detectorRef = useRef(null);
+  const exerciseStatesRef = useRef({});
 
   // React States
   const [isDetecting, setIsDetecting] = useState(true);
   const [isWebcamOn, setIsWebcamOn] = useState(true);
   const [openDrawer, setOpenDrawer] = useState(true);
   const [activeExercise, setActiveExercise] = useState(null);
-  const [intervalId, setIntervalId] = useState(null);
+  const [repCounts, setRepCounts] = useState({});
 
+  // Constants
   const drawerBleeding = 56;
+
+
+  // POSE DETECTION FUNCTIONS
 
   // Load Pose Detection, useEffect runs once
   useEffect(() => {
@@ -79,9 +102,7 @@ export default function Workout() {
     runPoseDetection();
   }, []);
 
-  /*
-    Detect poses on webcam feed, draw keypoints on canvas
-  */
+  // Detect poses on webcam feed, draw keypoints on canvas
   const detect = async () => {
     if (
       typeof webcamRef.current !== "undefined" &&
@@ -105,124 +126,127 @@ export default function Workout() {
 
       // Perform pose detection on the video
       const poses = await detectorRef.current.estimatePoses(video);
-      console.log(poses);
 
-      // Initialize required keypoints based on active exercise
-      let requiredKeypoints = new Set();
-
-      if (activeExercise) {
-        console.log("Active Exercise: ", activeExercise);
-        if (activeExercise === "bicepsCurl") {
-          requiredKeypoints = new Set([
-            "left_wrist",
-            "right_wrist",
-            "left_elbow",
-            "right_elbow",
-            "left_shoulder",
-            "right_shoulder",
-          ]);
-        }
+      // Draw the poses on the canvas
+      if (poses.length > 0) {
+        const filteredPoses = filterKeypoints(poses, activeExercise);
+        drawCanvas(filteredPoses, video, canvasRef.current);
       }
-
-      // Filter the poses to include only required keypoints
-      const filteredPoses = poses.map((pose) => ({
-        ...pose,
-        keypoints: pose.keypoints.filter(
-          (keypoint) =>
-            requiredKeypoints.has(keypoint.name) && keypoint.score > 0.3
-        ),
-      }));
-
-      // Log filtered poses for debugging
-      console.log("Filtered Poses:", filteredPoses);
-
-      // Draw the filtered keypoints
-      drawCanvas(filteredPoses, video, videoWidth, videoHeight, canvasRef);
-      keypointCalculations(filteredPoses);
     }
   };
 
-  const calculateAngle = (a, b, c) => {
-    // a, b, c are keypoints with x and y properties
-    const vectorAB = { x: b.x - a.x, y: b.y - a.y };
-    const vectorBC = { x: c.x - b.x, y: c.y - b.y };
-  
-    // Calculate dot product and magnitudes
-    const dotProduct =
-      vectorAB.x * vectorBC.x + vectorAB.y * vectorBC.y;
-    const magnitudeAB = Math.sqrt(vectorAB.x ** 2 + vectorAB.y ** 2);
-    const magnitudeBC = Math.sqrt(vectorBC.x ** 2 + vectorBC.y ** 2);
-  
-    // Calculate the angle in radians and convert to degrees
-    const angleInRadians = Math.acos(dotProduct / (magnitudeAB * magnitudeBC));
-    const angleInDegrees = (angleInRadians * 180) / Math.PI;
-  
-    return angleInDegrees;
+  // Filter out irrelevant keypoints for the current exercise
+  const filterKeypoints = (poses, exercise) => {
+    // If no exercise is selected, return all poses
+    if (!exercise || !exerciseCalculations[exercise]) return poses;
+
+    // Get the required keypoints for the exercise
+    const requiredKeypoints = new Set(
+      exerciseCalculations[exercise].angles.flat()
+    );
+
+    // Filter out irrelevant keypoints and those with low confidence
+    return poses.map((pose) => ({
+      ...pose,
+      keypoints: pose.keypoints.filter(
+        (kp) => requiredKeypoints.has(kp.name) && kp.score > 0.3
+      ),
+    }));
   };
 
-  const exerciseCalculations = {
-    bicepsCurl: (keypointsMap) => {
-      // Calculate left and right arm angles for biceps curl
-      if (
-        keypointsMap["left_shoulder"] &&
-        keypointsMap["left_elbow"] &&
-        keypointsMap["left_wrist"]
-      ) {
-        const leftArmAngle = calculateAngle(
-          keypointsMap["left_shoulder"],
-          keypointsMap["left_elbow"],
-          keypointsMap["left_wrist"]
-        );
-        console.log("Left Arm Angle (Biceps Curl):", leftArmAngle);
-      }
-  
-      if (
-        keypointsMap["right_shoulder"] &&
-        keypointsMap["right_elbow"] &&
-        keypointsMap["right_wrist"]
-      ) {
-        const rightArmAngle = calculateAngle(
-          keypointsMap["right_shoulder"],
-          keypointsMap["right_elbow"],
-          keypointsMap["right_wrist"]
-        );
-        console.log("Right Arm Angle (Biceps Curl):", rightArmAngle);
-      }
-    },
-  };
-  
+  // Calculate angles between keypoints
+  const calculateAngles = (poses, ctx) => {
+    // If no exercise is selected or no calculations are available, return
+    if (!activeExercise || !exerciseCalculations[activeExercise]) return;
 
-  const keypointCalculations = (poses) => {
-    if (!poses || poses.length === 0) return;
-  
+    // Get the required angles and whether to display them
+    const { angles, displayAngle, thresholds } =
+      exerciseCalculations[activeExercise];
+
+    // Data to store the angles
+    const anglesData = [];
+
     poses.forEach((pose) => {
-      const keypointsMap = pose.keypoints.reduce((map, keypoint) => {
-        map[keypoint.name] = keypoint;
-        return map;
-      }, {});
-  
-      // Call the calculation logic for the active exercise
-      if (activeExercise && exerciseCalculations[activeExercise]) {
-        exerciseCalculations[activeExercise](keypointsMap);
-      }
+      const keypointsMap = createKeypointMap(pose.keypoints);
+
+      angles.forEach(([a, b, c]) => {
+        if (keypointsMap[a] && keypointsMap[b] && keypointsMap[c]) {
+          const angle = calculateAngle(
+            keypointsMap[a],
+            keypointsMap[b],
+            keypointsMap[c]
+          );
+
+          // Store the angle data for color
+          anglesData.push({ joint: b, angle, thresholds });
+
+          // Display the angle near the corresponding joint (keypoint b)
+          if (displayAngle && ctx) {
+            ctx.fillStyle = "White";
+            ctx.font = "14px Arial";
+            ctx.fillText(
+              `${angle.toFixed(2)}°`,
+              keypointsMap[b].x + 10,
+              keypointsMap[b].y - 10
+            );
+          }
+
+          // Counts reps if threshold is reached
+          if (
+            angle < thresholds.end &&
+            exerciseStatesRef.current[b] == "start"
+          ) {
+            updateJointState(b, "end");
+            console.log(`${b} state changed to: end`);
+            setRepCounts((prev) => ({
+              ...prev,
+              [activeExercise]: (prev[activeExercise] || 0) + 1,
+            }));
+          } else if (
+            angle > thresholds.start &&
+            exerciseStatesRef.current[b] == "end"
+          ) {
+            updateJointState(b, "start");
+            console.log(`${b} state changed to: start`);
+          }
+        }
+      });
     });
+
+    return anglesData;
   };
-  
 
-  const drawCanvas = (poses, video, videoWidth, videoHeight, canvas) => {
-    const ctx = canvas.current.getContext("2d");
-
-    // Clear the canvas
-    ctx.clearRect(0, 0, videoWidth, videoHeight);
-
-    // Draw the video frame to the canvas
-    ctx.drawImage(video, 0, 0, videoWidth, videoHeight);
-
-    // Draw keypoints for each pose
-    poses.forEach((pose) => {
-      drawKeypoints(pose.keypoints, ctx);
-    });
+  const updateJointState = (joint, newState) => {
+    if (exerciseStatesRef.current[joint] !== newState) {
+      exerciseStatesRef.current[joint] = newState;
+      console.log(`${joint} state updated to:`, newState);
+    }
   };
+
+  // Draw keypoints and skeleton on the canvas
+  const drawCanvas = (poses, video, canvas) => {
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    // Calculate and optionally display angles
+    const anglesData = calculateAngles(poses, ctx);
+
+    // Draw keypoints and skeleton
+    poses.forEach((pose) => drawKeypointsAndSkeleton(pose.keypoints, ctx, anglesData));
+  };
+
+  // Initialize states and reps when exercise changes
+  useEffect(() => {
+    if (activeExercise) {
+      // Initialize states for all joints
+      exerciseStatesRef.current = {};
+      exerciseCalculations[activeExercise].angles.forEach(([_, joint]) => {
+        exerciseStatesRef.current[joint] = "start";
+      });
+      console.log("Initialized exerciseStatesRef:", exerciseStatesRef.current);
+    }
+  }, [activeExercise]);
 
   useEffect(() => {
     if (isDetecting) {
@@ -233,34 +257,7 @@ export default function Workout() {
     }
   }, [isDetecting, activeExercise]);
 
-  /*
-  // Effect for looping through the logic for each workout
-  useEffect(() => {
-    if (activeExercise == "bicepsCurl") {
-      const id = setInterval(() => {
-        console.log("Biceps Curl");
-      }, 100);
-
-      setIntervalId(id);
-    } else if (activeExercise == "pushUp") {
-      const id = setInterval(() => {
-        console.log("Push Up");
-      }, 100);
-
-      setIntervalId(id);
-    } else if (intervalId) {
-      // Clears interval if active exercise changes
-      clearInterval(intervalId);
-      setIntervalId(null);
-    }
-
-    // When component unmounts, clear interval
-    return () => {
-      if (intervalId) {
-        clearInterval(intervalId);
-      }
-    };
-  }, [activeExercise]);*/
+  // UI FUNCTIONS
 
   const toggleWebcam = () => {
     if (webcamRef.current) {
@@ -287,30 +284,6 @@ export default function Workout() {
 
   const workouts = [
     {
-      id: "pushUp",
-      name: "Push Up",
-      icon: (
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          viewBox="0 0 100 100"
-          fill="currentColor"
-          width="24" // Adjust as needed for size
-          height="24" // Adjust as needed for size
-        >
-          <g>
-            <ellipse
-              cx="87.8"
-              cy="34.3"
-              rx="9.7"
-              ry="9.7"
-              transform="rotate(-45 87.8 34.3)"
-            />
-            <path d="M93.7,71.5H85c2-1.3,2.6-3.9,1.4-6L81,56.8l-0.8-7.2c-0.1-1.4-0.8-3.5-1.4-4.7c-3.6-6.9-3.9-7.1-4.7-7.8c-1.8-1.6-4-2.2-6.8-1.2S49,42.4,49,42.4c-2.2,0.8-4.1,2.1-5.6,3.9l-6.8,7.9c-0.3,0.4-0.8,0.7-1.3,0.9l-21.9,7.4c-2.6,0.9-4.1,3.8-3.2,6.4c0.4,1.2,1.3,2.2,2.3,2.8H4.5c-1.1,0-2,0.9-2,2c0,1.1,0.9,2,2,2h89.2c1.1,0,2-0.9,2-2C95.7,72.4,94.8,71.5,93.7,71.5ZM80.3,71.5H17.9l54-18.2l0.5,4.3c0.1,1.3,0.6,2.6,1.3,3.7l5.3,8.7C79.3,70.7,79.8,71.2,80.3,71.5Z" />
-          </g>
-        </svg>
-      ),
-    },
-    {
       id: "bicepsCurl",
       name: "Biceps Curl",
       icon: (
@@ -325,6 +298,30 @@ export default function Workout() {
         </svg>
       ),
     },
+    {
+      id: "pushUp",
+      name: "Push Up",
+      icon: (
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 100 100"
+          fill="currentColor"
+          width="24"
+          height="24"
+        >
+          <g>
+            <ellipse
+              cx="87.8"
+              cy="34.3"
+              rx="9.7"
+              ry="9.7"
+              transform="rotate(-45 87.8 34.3)"
+            />
+            <path d="M93.7,71.5H85c2-1.3,2.6-3.9,1.4-6L81,56.8l-0.8-7.2c-0.1-1.4-0.8-3.5-1.4-4.7c-3.6-6.9-3.9-7.1-4.7-7.8c-1.8-1.6-4-2.2-6.8-1.2S49,42.4,49,42.4c-2.2,0.8-4.1,2.1-5.6,3.9l-6.8,7.9c-0.3,0.4-0.8,0.7-1.3,0.9l-21.9,7.4c-2.6,0.9-4.1,3.8-3.2,6.4c0.4,1.2,1.3,2.2,2.3,2.8H4.5c-1.1,0-2,0.9-2,2c0,1.1,0.9,2,2,2h89.2c1.1,0,2-0.9,2-2C95.7,72.4,94.8,71.5,93.7,71.5ZM80.3,71.5H17.9l54-18.2l0.5,4.3c0.1,1.3,0.6,2.6,1.3,3.7l5.3,8.7C79.3,70.7,79.8,71.2,80.3,71.5Z" />
+          </g>
+        </svg>
+      ),
+    },
   ];
 
   return (
@@ -336,7 +333,6 @@ export default function Workout() {
           backgroundColor: "white",
         }}
       >
-        {/* Sidebar */}
         <Sidebar>
           <SidebarItem
             icon={<HomeOutlined />}
@@ -356,10 +352,9 @@ export default function Workout() {
           ))}
         </Sidebar>
 
-        {/* Main Content */}
         <Box
           sx={{
-            flex: 1, // Allow main content to take up remaining space
+            flex: 1,
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
@@ -399,6 +394,17 @@ export default function Workout() {
                 height: "100%",
               }}
             />
+            <Typography
+              variant="h5"
+              sx={{
+                position: "absolute",
+                top: 20,
+                left: 20,
+                color: "black",
+              }}
+            >
+              Reps: {repCounts[activeExercise] || 0}
+            </Typography>
             {isWebcamOn ? (
               <IconButton
                 sx={{
@@ -444,3 +450,10 @@ export default function Workout() {
     </main>
   );
 }
+
+/*
+  SVG Citations
+
+  workout by Adrien Coquet from <a href="https://thenounproject.com/browse/icons/term/workout/" target="_blank" title="workout Icons">Noun Project</a> (CC BY 3.0)
+  workout by Popular from <a href="https://thenounproject.com/browse/icons/term/workout/" target="_blank" title="workout Icons">Noun Project</a> (CC BY 3.0)
+  */
